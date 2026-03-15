@@ -16,10 +16,12 @@ class FlashcardCard(BaseModel):
 
 
 class GenerateFlashcardsRequest(BaseModel):
-    scan_id: str
+    scan_id: Optional[str] = None
     deck_name: str
     num_cards: int
     additional_prompts: Optional[str] = None
+    content_text: Optional[str] = None
+    topics: Optional[List[str]] = None
 
 
 class ManualFlashcardsRequest(BaseModel):
@@ -42,28 +44,39 @@ async def generate_flashcard_deck(
     request: GenerateFlashcardsRequest,
     current_user: dict = Depends(get_current_user)
 ):
-    scans_collection = get_scans_collection()
-    scan = await scans_collection.find_one({
-        "_id": request.scan_id,
-        "user_id": current_user["_id"]
-    })
+    # Support both scan_id lookup and direct content_text
+    content_text = request.content_text
+    scan_id = request.scan_id or "direct"
+    topics = request.topics or []
 
-    if not scan:
-        raise HTTPException(status_code=404, detail="Scan not found")
+    if not content_text and request.scan_id:
+        scans_collection = get_scans_collection()
+        scan = await scans_collection.find_one({
+            "_id": request.scan_id,
+            "user_id": current_user["_id"]
+        })
+        if not scan:
+            raise HTTPException(status_code=404, detail="Scan not found")
+        content_text = scan.get("content_text", "")
+        scan_id = request.scan_id
+
+    if not content_text:
+        raise HTTPException(status_code=400, detail="No content provided. Upload a photo or PDF first.")
 
     if request.num_cards < 5 or request.num_cards > 30:
         raise HTTPException(status_code=400, detail="num_cards must be between 5 and 30")
 
     cards_data = await generate_flashcards(
-        scan.get("content_text", ""),
+        content_text,
         request.num_cards,
-        request.additional_prompts
+        request.additional_prompts,
+        topics,
     )
 
     deck = {
         "_id": str(uuid.uuid4()),
         "user_id": current_user["_id"],
-        "scan_id": request.scan_id,
+        "scan_id": scan_id,
         "deck_name": request.deck_name,
         "cards": [
             {

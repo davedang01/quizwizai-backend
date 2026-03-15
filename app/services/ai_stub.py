@@ -223,13 +223,17 @@ async def generate_study_guide(
 
 
 async def generate_flashcards(
-    content_text: str, num_cards: int, additional_prompts: str = None
+    content_text: str,
+    num_cards: int,
+    additional_prompts: str = None,
+    topics: List[str] = None,
 ) -> List[Dict[str, str]]:
     """Use Claude to generate flashcard pairs from study content."""
     client = get_client()
 
+    topics_note = f"\nFocus on these topics: {', '.join(topics)}" if topics else ""
     extra = (
-        f"\nAdditional instructions: {additional_prompts}" if additional_prompts else ""
+        f"\nAdditional instructions from the user: {additional_prompts}" if additional_prompts else ""
     )
 
     try:
@@ -241,7 +245,7 @@ async def generate_flashcards(
                     "role": "user",
                     "content": (
                         f"Create exactly {num_cards} flash cards based on this study material:\n\n"
-                        f"{content_text[:3000]}{extra}\n\n"
+                        f"{content_text[:3000]}{topics_note}{extra}\n\n"
                         'Respond with ONLY a JSON array. Each object must have "front" '
                         '(a question or term) and "back" (the answer or definition).\n'
                         'Example: [{"front": "What is X?", "back": "X is..."}]'
