@@ -11,12 +11,14 @@ router = APIRouter(prefix="/api/tests", tags=["tests"])
 
 
 class GenerateTestRequest(BaseModel):
-    scan_id: str
+    scan_id: Optional[str] = None
     test_name: str
     test_type: str
     difficulty: str
     num_questions: int
     additional_prompts: Optional[str] = None
+    content_text: Optional[str] = None
+    topics: Optional[List[str]] = None
 
 
 class SubmitAnswerItem(BaseModel):
@@ -63,24 +65,36 @@ class ResultResponse(BaseModel):
 
 @router.post("/generate", response_model=TestResponse)
 async def generate_test(request: GenerateTestRequest, current_user: dict = Depends(get_current_user)):
-    scans_collection = get_scans_collection()
-    scan = await scans_collection.find_one({"_id": request.scan_id, "user_id": current_user["_id"]})
+    # Support both scan_id lookup and direct content_text
+    content_text = request.content_text
+    scan_id = request.scan_id or "direct"
+    topics = request.topics or []
 
-    if not scan:
-        raise HTTPException(status_code=404, detail="Scan not found")
+    if not content_text and request.scan_id:
+        scans_collection = get_scans_collection()
+        scan = await scans_collection.find_one({"_id": request.scan_id, "user_id": current_user["_id"]})
+        if not scan:
+            raise HTTPException(status_code=404, detail="Scan not found")
+        content_text = scan["content_text"]
+        scan_id = request.scan_id
+
+    if not content_text:
+        raise HTTPException(status_code=400, detail="No content provided. Upload a photo or PDF first.")
 
     questions = await ai_stub.generate_questions(
-        content_text=scan["content_text"],
+        content_text=content_text,
         test_type=request.test_type,
         difficulty=request.difficulty,
-        num_questions=request.num_questions
+        num_questions=request.num_questions,
+        topics=topics,
+        additional_prompts=request.additional_prompts,
     )
 
     tests_collection = get_tests_collection()
     test = {
         "_id": str(uuid.uuid4()),
         "user_id": current_user["_id"],
-        "scan_id": request.scan_id,
+        "scan_id": scan_id,
         "test_name": request.test_name,
         "test_type": request.test_type,
         "difficulty": request.difficulty,

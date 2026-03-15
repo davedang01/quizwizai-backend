@@ -108,23 +108,28 @@ async def analyze_content(text_or_base64: str) -> Dict[str, Any]:
 
 
 async def generate_questions(
-    content_text: str, test_type: str, difficulty: str, num_questions: int
+    content_text: str,
+    test_type: str,
+    difficulty: str,
+    num_questions: int,
+    topics: List[str] = None,
+    additional_prompts: str = None,
 ) -> List[Dict[str, Any]]:
     """Use Claude to generate test questions based on content."""
     client = get_client()
 
     type_instructions = {
-        "Multiple Choice": (
+        "multiple-choice": (
             'multiple choice questions. Each must have "type": "multiple_choice", '
             '"text", "options" (array of 4 choices), and "correct_answer" (must match one option exactly).'
         ),
-        "Word Problems": (
+        "word-problems": (
             'word problems. Each must have "type": "word_problem", "text", and "correct_answer" (a number or short phrase).'
         ),
-        "Math Problems": (
+        "math-problems": (
             'math problems. Each must have "type": "math", "text", and "correct_answer" (a number).'
         ),
-        "Fill in the Blank": (
+        "fill-in-the-blank": (
             'fill-in-the-blank questions with a blank shown as ______. '
             'Each must have "type": "fill_blank", "text", and "correct_answer" (the word or phrase for the blank).'
         ),
@@ -138,6 +143,18 @@ async def generate_questions(
         ),
     )
 
+    # Build difficulty guidance
+    difficulty_guidance = {
+        "easy": "Keep questions straightforward, testing basic recall and simple understanding. Use clear, simple language appropriate for younger students.",
+        "medium": "Questions should require some reasoning and application of concepts. Include a mix of recall and comprehension questions.",
+        "hard": "Create challenging questions that require critical thinking, analysis, and deeper understanding. Include multi-step problems where appropriate.",
+    }
+    diff_note = difficulty_guidance.get(difficulty, "")
+
+    # Build optional context
+    topics_note = f"\nFocus on these topics: {', '.join(topics)}" if topics else ""
+    extra_note = f"\nAdditional instructions from the user: {additional_prompts}" if additional_prompts else ""
+
     try:
         message = await client.messages.create(
             model=MODEL,
@@ -147,7 +164,8 @@ async def generate_questions(
                     "role": "user",
                     "content": (
                         f"Generate exactly {num_questions} {instruction}\n"
-                        f"Difficulty level: {difficulty}\n\n"
+                        f"Difficulty level: {difficulty}. {diff_note}\n"
+                        f"{topics_note}{extra_note}\n\n"
                         f"Base the questions on this study content:\n{content_text[:3000]}\n\n"
                         "Respond with ONLY a JSON array, no other text. Example format:\n"
                         '[{"type": "multiple_choice", "text": "What is...?", '
@@ -331,12 +349,27 @@ async def generate_tutor_response(
             model=MODEL,
             max_tokens=2048,
             system=(
-                "You are Quiz Wiz AI Tutor, a friendly, patient, and encouraging tutor "
-                "for students of all ages. Help them understand concepts, solve problems, "
-                "and learn effectively. Use simple explanations, helpful analogies, and "
-                "guiding questions. Keep responses concise (2-4 paragraphs max) but "
-                "thorough. If a student is struggling, break things down into smaller "
-                "steps. Celebrate when they get things right!"
+                "You are Quiz Wiz AI Tutor — a warm, patient, and encouraging tutor for "
+                "students in 5th through 9th grade (ages 10-15). Your job is to help them "
+                "learn academic subjects and study effectively.\n\n"
+                "TONE & STYLE:\n"
+                "- Talk like a real tutor sitting next to the student — friendly, supportive, never condescending.\n"
+                "- Use simple, clear language appropriate for middle schoolers. Avoid jargon unless you explain it.\n"
+                "- Use relatable analogies and real-world examples to explain concepts (e.g., 'Think of fractions like slicing a pizza').\n"
+                "- Ask guiding questions to help students think through problems rather than just giving answers.\n"
+                "- When a student is stuck, break things into small steps. Say things like 'Let's start with what we know...'\n"
+                "- Celebrate effort and progress! Use encouraging phrases like 'Great thinking!' or 'You're getting closer!'\n"
+                "- Keep responses concise (2-4 short paragraphs). Students lose focus with long walls of text.\n"
+                "- If a student gets something right, acknowledge it warmly before moving on.\n"
+                "- If they're wrong, be gentle: 'That's a really common mistake — let me help you see why...'\n\n"
+                "ACADEMIC-ONLY GUARDRAIL:\n"
+                "You ONLY help with academic and study-related topics — math, science, history, English, "
+                "reading comprehension, writing, geography, foreign languages, test prep, homework, study skills, etc.\n"
+                "If the student asks about anything non-academic (personal advice, entertainment, games, social media, "
+                "current events, jokes unrelated to learning, or any off-topic conversation), respond warmly but firmly:\n"
+                "\"Ha, I appreciate the curiosity! But I'm your study buddy, so I can only help with school and learning stuff. "
+                "So — what subject can I help you with today? 📚\"\n"
+                "Do NOT answer off-topic questions even partially. Gently redirect every time."
             ),
             messages=claude_messages,
         )
