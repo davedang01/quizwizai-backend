@@ -1,405 +1,350 @@
 import uuid
-import random
+import json
+import logging
 from datetime import datetime
 from typing import List, Dict, Any
 
+import anthropic
 
-SUBJECT_POOLS = {
-    "Mathematics": {
-        "topics": ["Fractions", "Decimals", "Word Problems", "Algebra", "Geometry"],
-        "content": "This is extracted content from the uploaded material about Mathematics including fundamental concepts and practical applications."
-    },
-    "Science": {
-        "topics": ["Physics", "Chemistry", "Biology", "Earth Science"],
-        "content": "This is extracted content from the uploaded material about Science including experimental procedures and scientific principles."
-    },
-    "History": {
-        "topics": ["Ancient Civilizations", "Medieval Period", "Modern Era", "World Wars"],
-        "content": "This is extracted content from the uploaded material about History including key events and historical figures."
-    },
-    "English": {
-        "topics": ["Grammar", "Literature", "Reading Comprehension", "Writing"],
-        "content": "This is extracted content from the uploaded material about English language and literature."
-    },
-    "Computer Science": {
-        "topics": ["Programming", "Data Structures", "Algorithms", "Web Development"],
-        "content": "This is extracted content from the uploaded material about Computer Science and software development."
-    }
-}
+from ..config import get_settings
 
-DIFFICULTY_LEVELS = ["Easy", "Medium", "Hard"]
+logger = logging.getLogger(__name__)
 
-MULTIPLE_CHOICE_QUESTIONS = [
-    {
-        "text": "What is the capital of France?",
-        "options": ["London", "Paris", "Berlin", "Madrid"],
-        "correct_answer": "Paris"
-    },
-    {
-        "text": "What is 15 × 3?",
-        "options": ["35", "45", "55", "65"],
-        "correct_answer": "45"
-    },
-    {
-        "text": "Which planet is closest to the sun?",
-        "options": ["Venus", "Mercury", "Earth", "Mars"],
-        "correct_answer": "Mercury"
-    },
-    {
-        "text": "What is the chemical symbol for gold?",
-        "options": ["Go", "Au", "Ag", "Gd"],
-        "correct_answer": "Au"
-    },
-    {
-        "text": "Who wrote Romeo and Juliet?",
-        "options": ["Christopher Marlowe", "William Shakespeare", "Ben Jonson", "John Webster"],
-        "correct_answer": "William Shakespeare"
-    },
-    {
-        "text": "What is the largest ocean on Earth?",
-        "options": ["Atlantic Ocean", "Indian Ocean", "Arctic Ocean", "Pacific Ocean"],
-        "correct_answer": "Pacific Ocean"
-    }
-]
+MODEL = "claude-sonnet-4-20250514"
 
-WORD_PROBLEM_QUESTIONS = [
-    {
-        "text": "John has 5 apples and Mary gives him 3 more. How many apples does John have now?",
-        "correct_answer": "8"
-    },
-    {
-        "text": "A book costs $12 and you have $50. How much change will you get back?",
-        "correct_answer": "38"
-    },
-    {
-        "text": "If a car travels 60 miles in 1 hour, how far will it travel in 3 hours?",
-        "correct_answer": "180"
-    },
-    {
-        "text": "Sarah has twice as many pencils as Tom. If Tom has 7 pencils, how many does Sarah have?",
-        "correct_answer": "14"
-    },
-    {
-        "text": "A recipe calls for 2 cups of flour for every 1 cup of sugar. If you use 3 cups of sugar, how much flour do you need?",
-        "correct_answer": "6"
-    }
-]
 
-FILL_BLANK_QUESTIONS = [
-    {
-        "text": "The capital of Japan is ______.",
-        "correct_answer": "Tokyo"
-    },
-    {
-        "text": "Water boils at 100 degrees ______.",
-        "correct_answer": "Celsius"
-    },
-    {
-        "text": "Photosynthesis is the process by which plants convert ______ into glucose.",
-        "correct_answer": "light"
-    },
-    {
-        "text": "The Great Wall of China is located in ______.",
-        "correct_answer": "China"
-    },
-    {
-        "text": "A triangle has ______ sides.",
-        "correct_answer": "three"
-    }
-]
+def get_client() -> anthropic.AsyncAnthropic:
+    settings = get_settings()
+    return anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 
-MATH_PROBLEMS = [
-    {
-        "text": "Solve: 2x + 5 = 13",
-        "correct_answer": "4"
-    },
-    {
-        "text": "What is 12% of 250?",
-        "correct_answer": "30"
-    },
-    {
-        "text": "Calculate: (5 + 3) × 2 - 1",
-        "correct_answer": "15"
-    },
-    {
-        "text": "What is the square root of 144?",
-        "correct_answer": "12"
-    },
-    {
-        "text": "If y = 2x - 3, what is y when x = 5?",
-        "correct_answer": "7"
-    }
-]
+
+def _parse_json(text: str, fallback: Any = None) -> Any:
+    """Attempt to parse JSON from Claude's response, handling markdown fences."""
+    # Try direct parse first
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Try stripping markdown code fences
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.split("\n")
+        # Remove first line (```json) and last line (```)
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        cleaned = "\n".join(lines)
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            pass
+
+    # Try finding JSON array or object in the text
+    for start_char, end_char in [("[", "]"), ("{", "}")]:
+        start = text.find(start_char)
+        end = text.rfind(end_char)
+        if start >= 0 and end > start:
+            try:
+                return json.loads(text[start : end + 1])
+            except json.JSONDecodeError:
+                pass
+
+    return fallback
 
 
 async def analyze_content(text_or_base64: str) -> Dict[str, Any]:
-    """Stubbed AI service: analyze uploaded content and extract information"""
-    subject = random.choice(list(SUBJECT_POOLS.keys()))
-    subject_data = SUBJECT_POOLS[subject]
+    """Use Claude to analyze uploaded study content and extract metadata."""
+    client = get_client()
+
+    # Truncate very long content to stay within token limits
+    content_preview = text_or_base64[:4000]
+
+    try:
+        message = await client.messages.create(
+            model=MODEL,
+            max_tokens=1024,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "Analyze the following study material. Respond with ONLY a JSON object, "
+                        "no other text:\n"
+                        '{"subject": "<subject area like Mathematics, Science, History, English, etc>",'
+                        ' "topics": ["topic1", "topic2", "topic3"],'
+                        ' "difficulty": "<Easy|Medium|Hard>",'
+                        ' "content_text": "<2-3 sentence summary of what the material covers>"}\n\n'
+                        f"Material:\n{content_preview}"
+                    ),
+                }
+            ],
+        )
+
+        result = _parse_json(
+            message.content[0].text,
+            {
+                "subject": "General",
+                "topics": ["Study Material"],
+                "difficulty": "Medium",
+                "content_text": message.content[0].text[:500],
+            },
+        )
+    except Exception as e:
+        logger.error(f"Claude API error in analyze_content: {e}")
+        result = {
+            "subject": "General",
+            "topics": ["Study Material"],
+            "difficulty": "Medium",
+            "content_text": "Content uploaded successfully. AI analysis is temporarily unavailable.",
+        }
 
     return {
         "id": str(uuid.uuid4()),
-        "content_text": subject_data["content"],
-        "subject": subject,
-        "topics": random.sample(subject_data["topics"], k=min(3, len(subject_data["topics"]))),
-        "difficulty": random.choice(DIFFICULTY_LEVELS),
-        "num_pages": random.randint(1, 5),
-        "created_at": datetime.utcnow().isoformat()
+        "content_text": result.get("content_text", ""),
+        "subject": result.get("subject", "General"),
+        "topics": result.get("topics", ["General"]),
+        "difficulty": result.get("difficulty", "Medium"),
+        "num_pages": 1,
+        "created_at": datetime.utcnow().isoformat(),
     }
 
 
 async def generate_questions(
-    content_text: str,
-    test_type: str,
-    difficulty: str,
-    num_questions: int
+    content_text: str, test_type: str, difficulty: str, num_questions: int
 ) -> List[Dict[str, Any]]:
-    """Stubbed AI service: generate test questions based on type and difficulty"""
+    """Use Claude to generate test questions based on content."""
+    client = get_client()
+
+    type_instructions = {
+        "Multiple Choice": (
+            'multiple choice questions. Each must have "type": "multiple_choice", '
+            '"text", "options" (array of 4 choices), and "correct_answer" (must match one option exactly).'
+        ),
+        "Word Problems": (
+            'word problems. Each must have "type": "word_problem", "text", and "correct_answer" (a number or short phrase).'
+        ),
+        "Math Problems": (
+            'math problems. Each must have "type": "math", "text", and "correct_answer" (a number).'
+        ),
+        "Fill in the Blank": (
+            'fill-in-the-blank questions with a blank shown as ______. '
+            'Each must have "type": "fill_blank", "text", and "correct_answer" (the word or phrase for the blank).'
+        ),
+    }
+
+    instruction = type_instructions.get(
+        test_type,
+        (
+            "a mix of multiple choice, word problems, math, and fill-in-the-blank questions. "
+            "Use the appropriate type field for each."
+        ),
+    )
+
+    try:
+        message = await client.messages.create(
+            model=MODEL,
+            max_tokens=4096,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        f"Generate exactly {num_questions} {instruction}\n"
+                        f"Difficulty level: {difficulty}\n\n"
+                        f"Base the questions on this study content:\n{content_text[:3000]}\n\n"
+                        "Respond with ONLY a JSON array, no other text. Example format:\n"
+                        '[{"type": "multiple_choice", "text": "What is...?", '
+                        '"options": ["A", "B", "C", "D"], "correct_answer": "B"}]'
+                    ),
+                }
+            ],
+        )
+
+        questions_raw = _parse_json(message.content[0].text, [])
+    except Exception as e:
+        logger.error(f"Claude API error in generate_questions: {e}")
+        questions_raw = []
+
     questions = []
-
-    if test_type == "Multiple Choice":
-        pool = MULTIPLE_CHOICE_QUESTIONS
-        for i in range(min(num_questions, len(pool))):
-            q = random.choice(pool)
-            questions.append({
-                "id": str(uuid.uuid4()),
-                "type": "multiple_choice",
-                "text": q["text"],
-                "options": q["options"],
-                "correct_answer": q["correct_answer"],
-                "difficulty": difficulty
-            })
-
-    elif test_type == "Word Problems":
-        pool = WORD_PROBLEM_QUESTIONS
-        for i in range(min(num_questions, len(pool))):
-            q = random.choice(pool)
-            questions.append({
-                "id": str(uuid.uuid4()),
-                "type": "word_problem",
-                "text": q["text"],
-                "correct_answer": q["correct_answer"],
-                "difficulty": difficulty
-            })
-
-    elif test_type == "Math Problems":
-        pool = MATH_PROBLEMS
-        for i in range(min(num_questions, len(pool))):
-            q = random.choice(pool)
-            questions.append({
-                "id": str(uuid.uuid4()),
-                "type": "math",
-                "text": q["text"],
-                "correct_answer": q["correct_answer"],
-                "difficulty": difficulty
-            })
-
-    elif test_type == "Fill in the Blank":
-        pool = FILL_BLANK_QUESTIONS
-        for i in range(min(num_questions, len(pool))):
-            q = random.choice(pool)
-            questions.append({
-                "id": str(uuid.uuid4()),
-                "type": "fill_blank",
-                "text": q["text"],
-                "correct_answer": q["correct_answer"],
-                "difficulty": difficulty
-            })
-
-    else:  # Mixed
-        pools = [MULTIPLE_CHOICE_QUESTIONS, WORD_PROBLEM_QUESTIONS, MATH_PROBLEMS, FILL_BLANK_QUESTIONS]
-        types = ["multiple_choice", "word_problem", "math", "fill_blank"]
-
-        for i in range(num_questions):
-            pool_idx = i % len(pools)
-            pool = pools[pool_idx]
-            q_type = types[pool_idx]
-            q = random.choice(pool)
-
-            if q_type == "multiple_choice":
-                questions.append({
-                    "id": str(uuid.uuid4()),
-                    "type": q_type,
-                    "text": q["text"],
-                    "options": q["options"],
-                    "correct_answer": q["correct_answer"],
-                    "difficulty": difficulty
-                })
-            else:
-                questions.append({
-                    "id": str(uuid.uuid4()),
-                    "type": q_type,
-                    "text": q["text"],
-                    "correct_answer": q["correct_answer"],
-                    "difficulty": difficulty
-                })
+    for q in questions_raw[:num_questions]:
+        q["id"] = str(uuid.uuid4())
+        q["difficulty"] = difficulty
+        # Ensure type field exists
+        if "type" not in q:
+            q["type"] = "multiple_choice" if "options" in q else "fill_blank"
+        questions.append(q)
 
     return questions
 
 
 def grade_answer(question: Dict[str, Any], user_answer: str) -> bool:
-    """Grade a user's answer by simple comparison (case-insensitive for text)"""
+    """Grade a user's answer by simple comparison (case-insensitive for text)."""
     correct = question.get("correct_answer", "").strip().lower()
     user = user_answer.strip().lower()
     return user == correct
 
 
-async def generate_study_guide(wrong_answers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Stubbed AI service: generate study guide for incorrect answers"""
+async def generate_study_guide(
+    wrong_answers: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Generate study guide entries for a list of wrong answers."""
     study_guide = []
-
-    study_tips = [
-        "Review the fundamental concepts related to this topic.",
-        "Practice similar problems to build your understanding.",
-        "Break down the problem into smaller, manageable parts.",
-        "Refer to textbook examples for clarification.",
-        "Work with a study partner to discuss the concept.",
-        "Watch tutorial videos on this topic.",
-        "Take notes on key definitions and formulas.",
-        "Create a mind map to visualize relationships."
-    ]
-
     for answer in wrong_answers:
-        study_guide.append({
-            "question_id": answer.get("question_id"),
-            "topic": answer.get("topic", "General"),
-            "explanation": random.choice(study_tips),
-            "resource_link": "https://example.com/study",
-            "difficulty_adjustment": random.choice(["Keep at same level", "Try easier problems first", "Increase difficulty gradually"])
-        })
-
+        entry = await generate_study_guide_entry(
+            answer.get("question_text", ""),
+            answer.get("user_answer", ""),
+            answer.get("correct_answer", ""),
+        )
+        study_guide.append(
+            {
+                "question_id": answer.get("question_id"),
+                "topic": answer.get("topic", "General"),
+                "explanation": entry["explanation"],
+                "resource_link": "https://example.com/study",
+                "difficulty_adjustment": entry.get("tips", "Review this topic"),
+            }
+        )
     return study_guide
 
 
-async def generate_flashcards(content_text: str, num_cards: int, additional_prompts: str = None) -> List[Dict[str, str]]:
-    """Stubbed AI service: generate flashcard pairs from content"""
-    flashcard_pairs = [
-        {
-            "front": "What is the capital of France?",
-            "back": "Paris is the capital of France and serves as its largest city."
-        },
-        {
-            "front": "Define mitochondria",
-            "back": "The mitochondria is the powerhouse of the cell, responsible for producing ATP through cellular respiration."
-        },
-        {
-            "front": "What does photosynthesis do?",
-            "back": "Photosynthesis is the process where plants convert light energy, water, and carbon dioxide into glucose and oxygen."
-        },
-        {
-            "front": "Who wrote the Declaration of Independence?",
-            "back": "Thomas Jefferson was the primary author of the Declaration of Independence, adopted on July 4, 1776."
-        },
-        {
-            "front": "What is the formula for the area of a circle?",
-            "back": "The area of a circle is calculated as A = πr², where r is the radius of the circle."
-        },
-        {
-            "front": "Define photosynthesis",
-            "back": "The biochemical process by which plants use sunlight to synthesize glucose from carbon dioxide and water."
-        },
-        {
-            "front": "What is the periodic table?",
-            "back": "A systematic arrangement of all known chemical elements organized by atomic number and chemical properties."
-        },
-        {
-            "front": "Who was the first President of the United States?",
-            "back": "George Washington served as the first President of the United States from 1789 to 1797."
-        },
-        {
-            "front": "What is the Pythagorean theorem?",
-            "back": "In a right triangle, the square of the hypotenuse equals the sum of squares of the other two sides: a² + b² = c²."
-        },
-        {
-            "front": "Define osmosis",
-            "back": "The movement of water molecules across a semipermeable membrane from an area of high water concentration to low water concentration."
-        }
-    ]
+async def generate_flashcards(
+    content_text: str, num_cards: int, additional_prompts: str = None
+) -> List[Dict[str, str]]:
+    """Use Claude to generate flashcard pairs from study content."""
+    client = get_client()
 
-    cards = []
-    for i in range(min(num_cards, len(flashcard_pairs))):
-        pair = flashcard_pairs[i]
-        cards.append(pair)
+    extra = (
+        f"\nAdditional instructions: {additional_prompts}" if additional_prompts else ""
+    )
 
-    return cards
+    try:
+        message = await client.messages.create(
+            model=MODEL,
+            max_tokens=4096,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        f"Create exactly {num_cards} flash cards based on this study material:\n\n"
+                        f"{content_text[:3000]}{extra}\n\n"
+                        'Respond with ONLY a JSON array. Each object must have "front" '
+                        '(a question or term) and "back" (the answer or definition).\n'
+                        'Example: [{"front": "What is X?", "back": "X is..."}]'
+                    ),
+                }
+            ],
+        )
 
-
-async def generate_study_guide_entry(question: str, user_answer: str, correct_answer: str) -> Dict[str, str]:
-    """Stubbed AI service: generate explanation and tips for a wrong answer"""
-    explanations = [
-        "This question tests your understanding of fundamental concepts. The correct answer emphasizes the importance of this principle.",
-        "This is a common misconception. The key difference is understanding how these concepts relate to each other.",
-        "Pay attention to the specific wording of the question. The answer depends on the precise definition provided.",
-        "This topic requires connecting multiple concepts together. Review how they work in combination.",
-        "The correct answer reflects real-world application of this concept. Practice with similar scenarios."
-    ]
-
-    tips = [
-        "Review similar examples in your textbook and practice applying the same logic.",
-        "Break down the problem into smaller parts and solve each step carefully.",
-        "Create flashcards for key definitions and formulas related to this topic.",
-        "Work through practice problems with a study partner and discuss your reasoning.",
-        "Watch educational videos explaining this concept from different angles.",
-        "Write out the step-by-step solution process and identify where you went wrong.",
-        "Compare the wrong answer with the correct answer to understand the difference.",
-        "Memorize key formulas and definitions related to this topic."
-    ]
-
-    practice_questions = [
-        "Can you explain this concept in your own words?",
-        "How does this concept apply to a real-world situation?",
-        "Can you solve a similar problem with different numbers?",
-        "What would happen if you changed one variable in this problem?",
-        "How does this topic connect to what you learned previously?"
-    ]
-
-    return {
-        "explanation": random.choice(explanations),
-        "tips": random.choice(tips),
-        "practice_question": random.choice(practice_questions)
-    }
-
-
-async def generate_tutor_response(messages: List[Dict[str, str]], latest_message: str) -> str:
-    """Stubbed AI service: generate a tutoring-style response from AI tutor"""
-    tutor_responses = {
-        "default": [
-            "Great question! Let me help you understand this better. The key concept here is that we need to break down the problem into smaller parts. Can you tell me which part you found most confusing?",
-            "That's a really important topic to understand. I can help you with that! Think about it this way: what do you already know about this subject? Let's build on that foundation.",
-            "I appreciate your curiosity! This topic involves several steps. Let me explain the first one: [explanation]. Does that make sense so far?",
-            "Good thinking! You're on the right track. However, there's an important detail to consider. Can you think about what might be different about this situation?"
-        ],
-        "math": [
-            "Nice approach! Let me help you with the calculation. The first step is to identify what we're solving for. Have you set up the equation correctly?",
-            "This math problem requires us to follow these steps in order. First, let's simplify the expression. What do you get when you combine like terms?",
-            "Good attempt! Let's check your work step by step. Did you remember to apply the order of operations correctly?"
-        ],
-        "science": [
-            "Excellent curiosity about this scientific concept! Remember that science is about cause and effect. What do you think causes this phenomenon?",
-            "This is a fundamental principle in science. Think about the relationship between these two variables. How do they interact with each other?",
-            "Great observation! In science, we need to understand the 'why' behind things. Can you think about what mechanism is at work here?"
-        ],
-        "history": [
-            "History is full of interesting causes and effects. For this event, it's important to understand the context of the time. What factors do you think led to this happening?",
-            "That's a thought-provoking question about history! Let's look at this from different perspectives. What motivated the people involved in this event?"
-        ],
-        "english": [
-            "Great literary analysis! Remember that authors choose their words carefully. What effect do you think this word choice has on the reader?",
-            "This is an interesting interpretation of the text. Can you find specific evidence from the passage that supports your thinking?"
+        cards = _parse_json(message.content[0].text, [])
+    except Exception as e:
+        logger.error(f"Claude API error in generate_flashcards: {e}")
+        cards = [
+            {
+                "front": "AI generation error",
+                "back": "Could not generate flash cards. Please try again.",
+            }
         ]
-    }
 
-    message_lower = latest_message.lower()
-    response_key = "default"
+    return cards[:num_cards]
 
-    if any(word in message_lower for word in ["solve", "calculate", "equation", "math", "number", "formula"]):
-        response_key = "math"
-    elif any(word in message_lower for word in ["science", "experiment", "physics", "chemistry", "biology", "force", "energy"]):
-        response_key = "science"
-    elif any(word in message_lower for word in ["history", "historical", "event", "war", "civilization", "date"]):
-        response_key = "history"
-    elif any(word in message_lower for word in ["english", "literature", "book", "author", "poem", "character", "writing"]):
-        response_key = "english"
 
-    responses = tutor_responses.get(response_key, tutor_responses["default"])
-    return random.choice(responses)
+async def generate_study_guide_entry(
+    question: str, user_answer: str, correct_answer: str
+) -> Dict[str, str]:
+    """Use Claude to generate an explanation and tips for a wrong answer."""
+    client = get_client()
+
+    try:
+        message = await client.messages.create(
+            model=MODEL,
+            max_tokens=1024,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "A student answered this question incorrectly:\n\n"
+                        f"Question: {question}\n"
+                        f"Student's answer: {user_answer}\n"
+                        f"Correct answer: {correct_answer}\n\n"
+                        "Respond with ONLY a JSON object:\n"
+                        '{"explanation": "<clear explanation of why the correct answer is right>'
+                        '", "tips": "<specific study advice for this topic>'
+                        '", "practice_question": "<a similar practice question>"}'
+                    ),
+                }
+            ],
+        )
+
+        result = _parse_json(
+            message.content[0].text,
+            {
+                "explanation": message.content[0].text[:300],
+                "tips": "Review the material related to this topic and try similar practice problems.",
+                "practice_question": "Can you explain this concept in your own words?",
+            },
+        )
+    except Exception as e:
+        logger.error(f"Claude API error in generate_study_guide_entry: {e}")
+        result = {
+            "explanation": "Review the correct answer and compare it with your response.",
+            "tips": "Review the material and try again.",
+            "practice_question": "Can you explain this concept in your own words?",
+        }
+
+    return result
+
+
+async def generate_tutor_response(
+    messages: List[Dict[str, str]], latest_message: str
+) -> str:
+    """Use Claude as an AI tutor to respond to student questions."""
+    client = get_client()
+
+    # Build conversation history for Claude (last 10 messages for context)
+    claude_messages = []
+    for msg in messages[-10:]:
+        role = "user" if msg.get("role") == "user" else "assistant"
+        content = msg.get("content", "")
+        if content:
+            claude_messages.append({"role": role, "content": content})
+
+    # Ensure messages start with user and alternate properly
+    if not claude_messages:
+        claude_messages = [{"role": "user", "content": latest_message}]
+    else:
+        # Fix any consecutive same-role messages
+        fixed = []
+        for msg in claude_messages:
+            if fixed and fixed[-1]["role"] == msg["role"]:
+                fixed[-1]["content"] += "\n" + msg["content"]
+            else:
+                fixed.append(msg)
+        claude_messages = fixed
+
+        # Ensure first message is from user
+        if claude_messages[0]["role"] != "user":
+            claude_messages.insert(0, {"role": "user", "content": "Hello"})
+
+        # Ensure last message is from user
+        if claude_messages[-1]["role"] != "user":
+            claude_messages.append({"role": "user", "content": latest_message})
+
+    try:
+        message = await client.messages.create(
+            model=MODEL,
+            max_tokens=2048,
+            system=(
+                "You are Quiz Wiz AI Tutor, a friendly, patient, and encouraging tutor "
+                "for students of all ages. Help them understand concepts, solve problems, "
+                "and learn effectively. Use simple explanations, helpful analogies, and "
+                "guiding questions. Keep responses concise (2-4 paragraphs max) but "
+                "thorough. If a student is struggling, break things down into smaller "
+                "steps. Celebrate when they get things right!"
+            ),
+            messages=claude_messages,
+        )
+
+        return message.content[0].text
+    except Exception as e:
+        logger.error(f"Claude API error in generate_tutor_response: {e}")
+        return (
+            "I'm having a little trouble connecting right now. "
+            "Could you try asking your question again in a moment?"
+        )
