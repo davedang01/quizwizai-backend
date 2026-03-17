@@ -2,10 +2,13 @@ from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List, Optional
 import uuid
+import logging
 from datetime import datetime
 from ..database import get_homework_sessions_collection
 from ..dependencies import get_current_user
 from ..services.ai_stub import generate_tutor_response
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/homework", tags=["tutor"])
 
@@ -23,6 +26,7 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     has_attachment: bool = False
     attachment_type: Optional[str] = None
+    image_base64: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -87,7 +91,12 @@ async def chat_with_tutor(
 
     updated_messages = session.get("messages", []) + [user_message]
 
-    ai_response = await generate_tutor_response(updated_messages, request.message)
+    # Pass the image directly to Claude Vision so it can see the homework
+    ai_response = await generate_tutor_response(
+        updated_messages,
+        request.message or "Can you help me with this?",
+        image_base64=request.image_base64,
+    )
 
     assistant_message = {
         "role": "assistant",

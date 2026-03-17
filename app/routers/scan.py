@@ -30,12 +30,41 @@ class ScanResponse(BaseModel):
     created_at: str
 
 
+@router.get("/{scan_id}", response_model=ScanResponse)
+async def get_scan(scan_id: str, current_user: dict = Depends(get_current_user)):
+    """Fetch a previously saved scan analysis by ID."""
+    scans_collection = get_scans_collection()
+    scan = await scans_collection.find_one({"_id": scan_id, "user_id": current_user["_id"]})
+
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+
+    return ScanResponse(
+        id=scan["_id"],
+        user_id=scan["user_id"],
+        content_text=scan["content_text"],
+        subject=scan["subject"],
+        topics=scan["topics"],
+        difficulty=scan["difficulty"],
+        num_pages=scan["num_pages"],
+        created_at=scan["created_at"]
+    )
+
+
 @router.post("/analyze", response_model=ScanResponse)
-async def analyze_images(request: AnalyzeImagesRequest, current_user: dict = Depends(get_current_user)):
+async def analyze_images_endpoint(request: AnalyzeImagesRequest, current_user: dict = Depends(get_current_user)):
     if not request.images_base64:
         raise HTTPException(status_code=400, detail="No images provided")
 
-    analysis = await ai_stub.analyze_content(request.images_base64[0])
+    # Use Vision API to properly analyze the images
+    analysis = await ai_stub.analyze_images(request.images_base64)
+
+    # If analysis failed, return an error instead of saving garbage content
+    if analysis.get("analysis_failed"):
+        raise HTTPException(
+            status_code=422,
+            detail="We couldn't read the uploaded image(s). Please try again with a clearer photo or ensure the image contains readable text/content."
+        )
 
     scans_collection = get_scans_collection()
     scan = {
@@ -72,6 +101,13 @@ async def analyze_pdf(request: AnalyzePdfRequest, current_user: dict = Depends(g
         raise HTTPException(status_code=400, detail="No PDF provided")
 
     analysis = await ai_stub.analyze_content(request.pdf_base64)
+
+    # If analysis failed, return an error instead of saving garbage content
+    if analysis.get("analysis_failed"):
+        raise HTTPException(
+            status_code=422,
+            detail="We couldn't read the uploaded PDF. Please try again with a different file or ensure it contains readable text."
+        )
 
     scans_collection = get_scans_collection()
     scan = {

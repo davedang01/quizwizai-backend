@@ -1,4 +1,9 @@
 import os
+from dotenv import load_dotenv
+
+# Load .env into os.environ BEFORE any other imports that read env vars
+load_dotenv()
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager

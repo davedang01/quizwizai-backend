@@ -11,12 +11,14 @@ router = APIRouter(prefix="/api/tests", tags=["tests"])
 
 
 class GenerateTestRequest(BaseModel):
-    scan_id: str
+    scan_id: Optional[str] = None
     test_name: str
     test_type: str
     difficulty: str
     num_questions: int
     additional_prompts: Optional[str] = None
+    content_text: Optional[str] = None
+    topics: Optional[List[str]] = None
 
 
 class SubmitAnswerItem(BaseModel):
@@ -63,24 +65,58 @@ class ResultResponse(BaseModel):
 
 @router.post("/generate", response_model=TestResponse)
 async def generate_test(request: GenerateTestRequest, current_user: dict = Depends(get_current_user)):
-    scans_collection = get_scans_collection()
-    scan = await scans_collection.find_one({"_id": request.scan_id, "user_id": current_user["_id"]})
+    # Support both scan_id lookup and direct content_text
+    content_text = request.content_text
+    scan_id = request.scan_id or "direct"
+    topics = request.topics or []
 
-    if not scan:
-        raise HTTPException(status_code=404, detail="Scan not found")
+    if not content_text and request.scan_id:
+        scans_collection = get_scans_collection()
+        scan = await scans_collection.find_one({"_id": request.scan_id, "user_id": current_user["_id"]})
+        if not scan:
+            raise HTTPException(status_code=404, detail="Scan not found")
+        content_text = scan["content_text"]
+        scan_id = request.scan_id
+
+    if not content_text:
+        raise HTTPException(status_code=400, detail="No content provided. Upload a photo or PDF first.")
+
+    # Guard against garbage/placeholder content from failed analysis
+    garbage_markers = [
+        "ai analysis is temporarily unavailable",
+        "content uploaded successfully",
+        "unable to process",
+    ]
+    content_lower = content_text.lower().strip()
+    if any(marker in content_lower for marker in garbage_markers) or len(content_lower) < 20:
+        raise HTTPException(
+            status_code=422,
+            detail="The uploaded content could not be analyzed properly. Please re-upload a clearer photo or PDF and try again."
+        )
+
+    # Validate math content if user selected Math Problems
+    if request.test_type == "math-problems":
+        is_math = await ai_stub.check_math_content(content_text)
+        if not is_math:
+            raise HTTPException(
+                status_code=400,
+                detail="Hmm it appears the provided images are not Math-related. Please try another Quiz Type."
+            )
 
     questions = await ai_stub.generate_questions(
-        content_text=scan["content_text"],
+        content_text=content_text,
         test_type=request.test_type,
         difficulty=request.difficulty,
-        num_questions=request.num_questions
+        num_questions=request.num_questions,
+        topics=topics,
+        additional_prompts=request.additional_prompts,
     )
 
     tests_collection = get_tests_collection()
     test = {
         "_id": str(uuid.uuid4()),
         "user_id": current_user["_id"],
-        "scan_id": request.scan_id,
+        "scan_id": scan_id,
         "test_name": request.test_name,
         "test_type": request.test_type,
         "difficulty": request.difficulty,
@@ -206,12 +242,20 @@ async def submit_test(request: SubmitTestRequest, current_user: dict = Depends(g
         if not question:
             continue
 
-        is_correct = ai_stub.grade_answer(question, answer_item.answer)
+        # Use smart AI grading for math/word problems, simple match for multiple choice
+        qtype = question.get("type", "")
+        if qtype in ("math", "word_problem"):
+            grade_result = await ai_stub.grade_answer_smart(question, answer_item.answer)
+            is_correct = grade_result.get("is_correct", False)
+        else:
+            is_correct = ai_stub.grade_answer(question, answer_item.answer)
+
         if is_correct:
             num_correct += 1
 
         answers_detail.append({
             "question_id": answer_item.question_id,
+            "question_text": question.get("text") or question.get("question", ""),
             "user_answer": answer_item.answer,
             "correct_answer": question.get("correct_answer"),
             "is_correct": is_correct
@@ -254,3 +298,50 @@ async def submit_test(request: SubmitTestRequest, current_user: dict = Depends(g
         answers=result["answers"],
         created_at=result["created_at"]
     )
+
+
+@router.get("/results/{result_id}")
+async def get_enriched_result(result_id: str, current_user: dict = Depends(get_current_user)):
+    """Return a test result in the enriched format the frontend expects:
+    wrong_answers, correct_answers, percentage, test_name, etc."""
+    results_collection = get_results_collection()
+    result = await results_collection.find_one({
+        "_id": result_id,
+        "user_id": current_user["_id"]
+    })
+
+    if not result:
+        raise HTTPException(status_code=404, detail="Result not found")
+
+    # Look up the test for name and scan_id
+    tests_collection = get_tests_collection()
+    test = await tests_collection.find_one({"_id": result["test_id"]})
+    test_name = test["test_name"] if test else "Unnamed Test"
+
+    answers = result.get("answers", [])
+    wrong_answers = []
+    correct_answers = []
+
+    for ans in answers:
+        if ans.get("is_correct"):
+            correct_answers.append(ans.get("question_id", ""))
+        else:
+            wrong_answers.append({
+                "question_id": ans.get("question_id", ""),
+                "question": ans.get("question_text", ""),
+                "user_answer": ans.get("user_answer", ""),
+                "correct_answer": ans.get("correct_answer", ""),
+            })
+
+    return {
+        "id": result["_id"],
+        "user_id": result["user_id"],
+        "test_id": result["test_id"],
+        "test_name": test_name,
+        "score": result["score"],
+        "percentage": round(result["score"]),
+        "total_questions": result["num_total"],
+        "correct_answers": correct_answers,
+        "wrong_answers": wrong_answers,
+        "timestamp": result["created_at"],
+    }
