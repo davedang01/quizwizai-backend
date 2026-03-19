@@ -112,20 +112,37 @@ If you didn't request this, you can safely ignore this email.
     msg.attach(MIMEText(text_body, "plain"))
     msg.attach(MIMEText(html_body, "html"))
 
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-            server.sendmail(GMAIL_USER, to_email, msg.as_string())
-    except smtplib.SMTPAuthenticationError:
-        raise HTTPException(
-            status_code=500,
-            detail="Email authentication failed. Please contact the administrator."
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to send reset email: {str(e)}"
-        )
+    last_error = None
+
+    # Try port 465 (SSL) first, fall back to port 587 (STARTTLS)
+    for method in ["ssl", "starttls"]:
+        try:
+            if method == "ssl":
+                with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+                    server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+                    server.sendmail(GMAIL_USER, to_email, msg.as_string())
+            else:
+                with smtplib.SMTP("smtp.gmail.com", 587) as server:
+                    server.ehlo()
+                    server.starttls()
+                    server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+                    server.sendmail(GMAIL_USER, to_email, msg.as_string())
+            print(f"[email] Sent via {method} (port {'465' if method == 'ssl' else '587'})")
+            return  # Success — exit the function
+        except smtplib.SMTPAuthenticationError as e:
+            raise HTTPException(
+                status_code=500,
+                detail="Email authentication failed. Please contact the administrator."
+            )
+        except Exception as e:
+            print(f"[email] {method} attempt failed: {e}")
+            last_error = e
+            continue
+
+    raise HTTPException(
+        status_code=500,
+        detail=f"Failed to send reset email: {last_error}"
+    )
 
 
 # ─── Request/Response Models ────────────────────────────────
