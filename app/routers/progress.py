@@ -24,6 +24,7 @@ class Badge(BaseModel):
 
 class ProgressStats(BaseModel):
     total_tests: int
+    tests_created: int
     avg_score: float
     total_scans: int
     streak_days: int
@@ -44,6 +45,9 @@ async def get_progress_stats(current_user: dict = Depends(get_current_user)):
     ).to_list(None)
 
     total_tests = len(completed_tests)
+
+    # Total tests created (completed + pending)
+    tests_created = await tests_collection.count_documents({"user_id": user_id})
 
     results = await results_collection.find(
         {"user_id": user_id}
@@ -123,6 +127,7 @@ async def get_progress_stats(current_user: dict = Depends(get_current_user)):
 
     return ProgressStats(
         total_tests=total_tests,
+        tests_created=tests_created,
         avg_score=round(avg_score, 2),
         total_scans=total_scans,
         streak_days=streak_days,
