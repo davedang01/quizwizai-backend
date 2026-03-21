@@ -209,8 +209,15 @@ def _set_session_cookie(response: Response, session_token: str, max_age: int):
 
 @router.post("/signup")
 async def signup(request: SignupRequest, response: Response):
+    # Validate password length (consistent with reset-password endpoint)
+    if len(request.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+    # Normalize email to lowercase for consistent storage and lookup
+    normalized_email = request.email.strip().lower()
+
     # Check email allowlist
-    if not _is_email_approved(request.email):
+    if not _is_email_approved(normalized_email):
         raise HTTPException(
             status_code=403,
             detail="This email is not authorized to sign up. Please contact the administrator for access."
@@ -219,16 +226,16 @@ async def signup(request: SignupRequest, response: Response):
     users_collection = get_users_collection()
     settings = get_settings()
 
-    existing_user = await users_collection.find_one({"email": request.email})
+    existing_user = await users_collection.find_one({"email": normalized_email})
     if existing_user:
         raise HTTPException(status_code=400, detail="Email already registered")
 
-    hashed_password = bcrypt.hashpw(request.password.encode(), bcrypt.gensalt())
+    hashed_password = bcrypt.hashpw(request.password.encode(), bcrypt.gensalt()).decode()
 
     user = {
         "_id": str(uuid.uuid4()),
-        "name": request.name,
-        "email": request.email,
+        "name": request.name.strip(),
+        "email": normalized_email,
         "password_hash": hashed_password,
         "created_at": datetime.utcnow().isoformat(),
         "updated_at": datetime.utcnow().isoformat()
@@ -268,11 +275,19 @@ async def login(request: LoginRequest, response: Response):
     users_collection = get_users_collection()
     settings = get_settings()
 
-    user = await users_collection.find_one({"email": request.email})
+    # Normalize email to match how we store it on signup
+    normalized_email = request.email.strip().lower()
+
+    user = await users_collection.find_one({"email": normalized_email})
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    if not bcrypt.checkpw(request.password.encode(), user["password_hash"]):
+    # password_hash may be stored as bytes (Binary) or string — handle both
+    stored_hash = user["password_hash"]
+    if isinstance(stored_hash, str):
+        stored_hash = stored_hash.encode()
+
+    if not bcrypt.checkpw(request.password.encode(), stored_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     session_token = secrets.token_hex(32)
@@ -305,10 +320,11 @@ async def login(request: LoginRequest, response: Response):
 @router.post("/forgot-password")
 async def forgot_password(request: ForgotPasswordRequest):
     """Send a password reset email if the user exists."""
-    print(f"DEBUG FORGOT-PW: Request received for email={request.email}")
+    normalized_email = request.email.strip().lower()
+    print(f"DEBUG FORGOT-PW: Request received for email={normalized_email}")
     print(f"DEBUG FORGOT-PW: GMAIL_USER='{GMAIL_USER}', HAS_PASSWORD={'yes' if GMAIL_APP_PASSWORD else 'no'}")
     users_collection = get_users_collection()
-    user = await users_collection.find_one({"email": request.email})
+    user = await users_collection.find_one({"email": normalized_email})
 
     # Always return success to avoid email enumeration attacks
     success_msg = "If an account with that email exists, a reset link has been sent."
@@ -365,7 +381,7 @@ async def reset_password(request: ResetPasswordRequest):
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
 
     # Update password and clear reset token
-    hashed_password = bcrypt.hashpw(request.new_password.encode(), bcrypt.gensalt())
+    hashed_password = bcrypt.hashpw(request.new_password.encode(), bcrypt.gensalt()).decode()
 
     await users_collection.update_one(
         {"_id": user["_id"]},
@@ -419,5 +435,18 @@ async def get_me(request: Request, session_token: str = Cookie(None)):
 
 @router.post("/logout")
 async def logout(response: Response):
-    response.delete_cookie("session_token")
+    if IS_PRODUCTION:
+        response.delete_cookie(
+            key="session_token",
+            httponly=True,
+            secure=True,
+            samesite="none",
+        )
+    else:
+        response.delete_cookie(
+            key="session_token",
+            httponly=True,
+            secure=False,
+            samesite="lax",
+        )
     return {"message": "Logged out successfully"}
