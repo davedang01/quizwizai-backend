@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 import uuid
 from datetime import datetime
-from ..database import get_flashcards_collection, get_scans_collection
+from ..database import get_flashcards_collection, get_scans_collection, get_users_collection
 from ..dependencies import get_current_user
 from ..services.ai_stub import generate_flashcards
 
@@ -66,10 +66,17 @@ async def generate_flashcard_deck(
     if request.num_cards < 5 or request.num_cards > 30:
         raise HTTPException(status_code=400, detail="num_cards must be between 5 and 30")
 
+    users_collection = get_users_collection()
+    user_doc = await users_collection.find_one({"_id": current_user["_id"]})
+    about_me = user_doc.get("about_me") if user_doc else None
+    effective_prompts = request.additional_prompts or ""
+    if about_me and about_me.strip():
+        effective_prompts = f"Student profile: {about_me.strip()}\n{effective_prompts}".strip()
+
     cards_data = await generate_flashcards(
         content_text,
         request.num_cards,
-        request.additional_prompts,
+        effective_prompts or None,
         topics,
     )
 

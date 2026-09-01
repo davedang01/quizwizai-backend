@@ -63,7 +63,7 @@ async def analyze_images_endpoint(request: AnalyzeImagesRequest, current_user: d
     if analysis.get("analysis_failed"):
         raise HTTPException(
             status_code=422,
-            detail="We couldn't read the uploaded image(s). Please try again with a clearer photo or ensure the image contains readable text/content."
+            detail="There was a problem processing your image(s). Please try again."
         )
 
     scans_collection = get_scans_collection()

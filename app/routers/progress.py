@@ -9,9 +9,10 @@ router = APIRouter(prefix="/api/progress", tags=["progress"])
 
 
 class RecentResult(BaseModel):
+    result_id: str
     test_id: str
     test_name: str
-    score: float
+    percentage: float
     created_at: str
 
 
@@ -63,9 +64,10 @@ async def get_progress_stats(current_user: dict = Depends(get_current_user)):
         test = tests_by_id.get(result["test_id"])
         if test:
             recent_results.append(RecentResult(
+                result_id=str(result["_id"]),
                 test_id=result["test_id"],
                 test_name=test["test_name"],
-                score=result["score"],
+                percentage=round(result["score"], 1),
                 created_at=result["created_at"]
             ))
 

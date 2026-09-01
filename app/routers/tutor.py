@@ -4,9 +4,9 @@ from typing import List, Optional
 import uuid
 import logging
 from datetime import datetime
-from ..database import get_homework_sessions_collection
+from ..database import get_homework_sessions_collection, get_users_collection
 from ..dependencies import get_current_user
-from ..services.ai_stub import generate_tutor_response
+from ..services.ai_stub import generate_tutor_response, generate_session_title
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,23 @@ async def chat_with_tutor(
     request: ChatRequest,
     current_user: dict = Depends(get_current_user)
 ):
+    image_b64_len = len(request.image_base64) if request.image_base64 else 0
+    logger.info(
+        "[/homework/chat] entry user=%s session=%s msg_len=%d has_attachment=%s "
+        "attachment_type=%s image_b64_len=%d",
+        current_user.get("_id"),
+        request.session_id,
+        len(request.message or ""),
+        request.has_attachment,
+        request.attachment_type,
+        image_b64_len,
+    )
+
     homework_sessions_collection = get_homework_sessions_collection()
+
+    users_collection = get_users_collection()
+    user_doc = await users_collection.find_one({"_id": current_user["_id"]})
+    about_me = user_doc.get("about_me") if user_doc else None
 
     session_id = request.session_id
     session = None
@@ -68,6 +84,7 @@ async def chat_with_tutor(
         })
 
         if not session:
+            logger.warning("[/homework/chat] session %s not found for user %s", session_id, current_user.get("_id"))
             raise HTTPException(status_code=404, detail="Session not found")
     else:
         session_id = str(uuid.uuid4())
@@ -92,10 +109,23 @@ async def chat_with_tutor(
     updated_messages = session.get("messages", []) + [user_message]
 
     # Pass the image directly to Claude Vision so it can see the homework
-    ai_response = await generate_tutor_response(
-        updated_messages,
-        request.message or "Can you help me with this?",
-        image_base64=request.image_base64,
+    try:
+        ai_response = await generate_tutor_response(
+            updated_messages,
+            request.message or "Can you help me with this?",
+            image_base64=request.image_base64,
+            about_me=about_me,
+        )
+    except Exception:
+        # generate_tutor_response normally swallows API errors and returns a fallback string,
+        # so anything that escapes here is unexpected — log the full trace before re-raising.
+        logger.exception("[/homework/chat] unexpected error from generate_tutor_response")
+        raise
+
+    logger.info(
+        "[/homework/chat] ok session=%s response_len=%d",
+        session_id,
+        len(ai_response or ""),
     )
 
     assistant_message = {
@@ -117,6 +147,17 @@ async def chat_with_tutor(
             }
         }
     )
+
+    # Generate an AI title after the first exchange (1 user + 1 assistant message)
+    if len(final_messages) == 2:
+        try:
+            title = await generate_session_title(user_message["content"], ai_response)
+            await homework_sessions_collection.update_one(
+                {"_id": session_id},
+                {"$set": {"title": title}}
+            )
+        except Exception:
+            logger.warning("[/homework/chat] title generation failed, keeping default")
 
     return ChatResponse(
         response=ai_response,

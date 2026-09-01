@@ -6,3 +6,6 @@ dist/
 build/
 .pytest_cache/
 venv/
+.venv/
+.git.corrupted-backup/
+.git.corrupted-original/

@@ -2,12 +2,16 @@ import uuid
 import json
 import logging
 import base64
+import asyncio
+import os
 import re
 from io import BytesIO
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
-import anthropic
+import httpx
+
+from ..config import get_settings
 
 try:
     from PIL import Image
@@ -15,19 +19,178 @@ try:
 except ImportError:
     HAS_PIL = False
 
-from ..config import get_settings
-
 logger = logging.getLogger(__name__)
+_settings = get_settings()
 
 if not HAS_PIL:
     logger.warning("[ai_stub] Pillow NOT installed — image compression disabled. Large images may fail.")
 
-MODEL = "claude-sonnet-4-20250514"
+# Model split:
+# - VISION_MODEL handles scanned images (Opus 4.7 — first Claude model with
+#   high-resolution image support, up to 2576px / 3.75MP). Used for OCR/vision
+#   on student homework, worksheets, textbook pages.
+# - TEXT_MODEL handles all text-only generation (quiz questions, flashcards,
+#   tutor responses without images, grading, study guides). Sonnet 4.6 is fast,
+#   cheap, and plenty capable for these.
+VISION_MODEL = "claude-opus-4-7"
+TEXT_MODEL = "claude-sonnet-4-6"
+
+# Ensure the claude CLI binary is on PATH regardless of how pm2 launched us
+_CLAUDE_PATH_ENV = {
+    **os.environ,
+    "PATH": f"/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{os.environ.get('PATH', '')}",
+}
 
 
-def get_client() -> anthropic.AsyncAnthropic:
-    settings = get_settings()
-    return anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+async def _call_claude_cli(
+    messages: List[Dict[str, Any]],
+    system_prompt: str,
+    model: str,
+) -> str:
+    """Invoke claude --print as a subprocess using the local Claude Code CLI.
+
+    Supports single-turn text calls (simple stdin piping) and multi-turn or
+    multimodal calls (stream-json format including base64 image content blocks).
+    Auth is handled automatically by the Claude Code CLI via the user's local
+    session — no API key required.
+    """
+    # Use stream-json when there are multiple messages or any message has
+    # non-string content (i.e., a list of content blocks including images).
+    needs_stream = len(messages) > 1 or any(
+        not isinstance(m.get("content"), str) for m in messages
+    )
+
+    base_cmd = [
+        "claude", "--print",
+        "--model", model,
+        "--system-prompt", system_prompt,
+        "--no-session-persistence",
+        "--tools", "",
+    ]
+
+    if needs_stream:
+        # stream-json input requires stream-json output (CLI enforces this)
+        cmd = base_cmd + [
+            "--input-format", "stream-json",
+            "--output-format", "stream-json",
+            "--verbose",
+        ]
+        lines = []
+        for m in messages:
+            content = m["content"]
+            # stream-json requires content as an array of blocks, not a bare string
+            if isinstance(content, str):
+                content = [{"type": "text", "text": content}]
+            lines.append(
+                json.dumps({"type": m["role"], "message": {"role": m["role"], "content": content}}) + "\n"
+            )
+        stdin_data = "".join(lines).encode()
+    else:
+        cmd = base_cmd + ["--output-format", "text", "--input-format", "text"]
+        stdin_data = (messages[0]["content"] if messages else "").encode()
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=_CLAUDE_PATH_ENV,
+    )
+    stdout, stderr = await proc.communicate(input=stdin_data)
+    raw = stdout.decode()
+
+    if needs_stream:
+        # Parse stream-json output: find the assistant message text block
+        for line in raw.splitlines():
+            try:
+                ev = json.loads(line)
+                if ev.get("type") == "result" and ev.get("is_error"):
+                    err_msg = ev.get("result", "unknown error")
+                    logger.error("[claude_cli] API error in stream-json result: %s", err_msg)
+                    raise RuntimeError(f"claude CLI stream error: {err_msg}")
+                if ev.get("type") == "assistant":
+                    for block in ev.get("message", {}).get("content", []):
+                        if block.get("type") == "text":
+                            return block["text"]
+            except (json.JSONDecodeError, RuntimeError):
+                raise
+            except Exception:
+                pass
+        raise RuntimeError("claude CLI stream-json: no assistant text found in output")
+
+    if proc.returncode != 0:
+        err = stderr.decode()
+        logger.error("[claude_cli] exit=%d stderr=%s", proc.returncode, err[:500])
+        raise RuntimeError(f"claude CLI: {err}")
+    return raw.strip()
+
+
+def _anthropic_content_to_openai(content: Any) -> Any:
+    """Convert Anthropic-style multimodal content blocks to OpenAI's format.
+
+    Our message-building code (analyze_images, tutor-with-image) constructs
+    Claude-style {"type": "image", "source": {...}} blocks. OpenRouter speaks
+    the OpenAI format ({"type": "image_url", "image_url": {"url": "data:..."}})
+    instead, so this is only needed on the OpenRouter path.
+    """
+    if isinstance(content, str):
+        return content
+    converted = []
+    for block in content:
+        if block.get("type") == "image":
+            media_type = block["source"]["media_type"]
+            data = block["source"]["data"]
+            converted.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{media_type};base64,{data}"},
+            })
+        else:
+            converted.append(block)
+    return converted
+
+
+async def _call_openrouter(
+    messages: List[Dict[str, Any]],
+    system_prompt: str,
+    model: str,
+) -> str:
+    """Invoke a model via OpenRouter's OpenAI-compatible chat completions API."""
+    full_messages = [{"role": "system", "content": system_prompt}] + [
+        {"role": m["role"], "content": _anthropic_content_to_openai(m["content"])}
+        for m in messages
+    ]
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {_settings.openrouter_api_key}"},
+            json={"model": model, "messages": full_messages},
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
+
+
+async def _call_text_model(
+    messages: List[Dict[str, Any]],
+    system_prompt: str,
+) -> str:
+    """Dispatch a text-only AI call per ai_text_provider (quiz/flashcard/study-guide/
+    grading/tutor-without-image). Vision calls never go through here — see _call_vision_model.
+    """
+    if _settings.ai_text_provider == "openrouter":
+        return await _call_openrouter(messages, system_prompt, model=_settings.openrouter_text_model)
+    return await _call_claude_cli(messages, system_prompt, model=TEXT_MODEL)
+
+
+async def _call_vision_model(
+    messages: List[Dict[str, Any]],
+    system_prompt: str,
+) -> str:
+    """Dispatch a vision AI call per ai_vision_provider (photo/PDF scanning, tutor-with-image)."""
+    if _settings.ai_vision_provider == "openrouter":
+        return await _call_openrouter(messages, system_prompt, model=_settings.openrouter_vision_model)
+    return await _call_claude_cli(messages, system_prompt, model=VISION_MODEL)
 
 
 def _parse_json(text: str, fallback: Any = None) -> Any:
@@ -68,14 +231,10 @@ def _parse_json(text: str, fallback: Any = None) -> Any:
 
 async def analyze_content(text_or_base64: str) -> Dict[str, Any]:
     """Use Claude to analyze uploaded text/PDF content and extract metadata."""
-    client = get_client()
     content_preview = text_or_base64[:8000]
 
     try:
-        message = await client.messages.create(
-            model=MODEL,
-            max_tokens=2048,
-            system="You are an expert educational content analyzer. Always respond with valid JSON only, no markdown or extra text.",
+        raw_text = await _call_text_model(
             messages=[
                 {
                     "role": "user",
@@ -94,19 +253,20 @@ async def analyze_content(text_or_base64: str) -> Dict[str, Any]:
                     ),
                 }
             ],
+            system_prompt="You are an expert educational content analyzer. Always respond with valid JSON only, no markdown or extra text.",
         )
 
         result = _parse_json(
-            message.content[0].text,
+            raw_text,
             {
                 "subject": "General",
                 "topics": ["Study Material"],
                 "difficulty": "Medium",
-                "content_text": message.content[0].text[:500],
+                "content_text": raw_text[:500],
             },
         )
     except Exception as e:
-        logger.error(f"Claude API error in analyze_content: {e}")
+        logger.error(f"Claude CLI error in analyze_content: {e}")
         result = {
             "subject": "General",
             "topics": ["Study Material"],
@@ -117,6 +277,9 @@ async def analyze_content(text_or_base64: str) -> Dict[str, Any]:
 
     content_text = result.get("content_text", "")
     analysis_failed = result.get("analysis_failed", False)
+
+    if not content_text:
+        analysis_failed = True
 
     if not analysis_failed and content_text:
         garbage_markers = [
@@ -247,8 +410,7 @@ def _process_image_for_api(image_base64: str) -> tuple:
 
 
 async def analyze_images(images_base64: List[str]) -> Dict[str, Any]:
-    """Use Claude Vision API to analyze uploaded images of study material."""
-    client = get_client()
+    """Use Claude Vision to analyze uploaded images of study material."""
     num_pages = len(images_base64)
 
     # Build content blocks: images first, then the analysis prompt
@@ -274,34 +436,48 @@ async def analyze_images(images_base64: List[str]) -> Dict[str, Any]:
     # Use appropriate prompt based on single vs multiple images
     if num_pages == 1:
         prompt_text = (
-            "Analyze this homework/workbook image and provide:\n"
-            "1. Full text content transcription — transcribe ALL text, numbers, equations, "
-            "tables, graphs descriptions, and problems visible in the image. Be thorough.\n"
-            "2. Subject (e.g., Math, Science, History, English)\n"
+            "You are looking at a PHOTO of a student's homework, worksheet, notes, or textbook page.\n\n"
+            "Your job is to READ and TRANSCRIBE the educational CONTENT written or printed ON the paper/page "
+            "visible in the photo.\n\n"
+            "CRITICAL RULES — READ CAREFULLY:\n"
+            "- DO NOT describe the photo itself (e.g., do NOT mention pixels, resolution, file size, "
+            "JPEG, image dimensions, compression, or any properties of the photograph)\n"
+            "- DO NOT analyze the camera, lighting, or image quality\n"
+            "- ONLY transcribe the text, numbers, equations, problems, and educational content "
+            "that is written or printed ON the physical page being photographed\n"
+            "- If you see handwritten or printed study material, copy it verbatim\n\n"
+            "Provide:\n"
+            "1. Full verbatim transcription of ALL text on the page (homework problems, notes, "
+            "vocabulary, equations, tables, answer choices, etc.)\n"
+            "2. Subject (e.g., Math, Science, History, English, Computer Science)\n"
             "3. List of 3-5 main topics covered\n"
             "4. Difficulty level (Easy, Medium, Hard)\n\n"
-            "IMPORTANT: The content_text field must contain a COMPLETE transcription of everything "
-            "in the image, including all numbers, answer choices, table data, and problem text. "
-            "Do NOT summarize — transcribe verbatim.\n\n"
             "You MUST respond with ONLY valid JSON, no other text:\n"
-            '{"content_text": "complete transcribed text",'
+            '{"content_text": "complete verbatim transcription of the page content",'
             ' "subject": "subject name",'
             ' "topics": ["topic1", "topic2"],'
             ' "difficulty": "level"}'
         )
     else:
         prompt_text = (
-            f"Analyze these {num_pages} pages of homework/workbook and provide:\n"
-            "1. Full text content transcription from ALL pages — transcribe ALL text, numbers, "
-            "equations, tables, graphs descriptions, and problems. Be thorough. Combine in page order.\n"
-            "2. Subject (e.g., Math, Science, History, English)\n"
+            f"You are looking at {num_pages} PHOTOS of a student's homework, worksheet, notes, or textbook pages.\n\n"
+            "Your job is to READ and TRANSCRIBE the educational CONTENT written or printed ON each page "
+            "visible in the photos.\n\n"
+            "CRITICAL RULES — READ CAREFULLY:\n"
+            "- DO NOT describe the photos themselves (e.g., do NOT mention pixels, resolution, file size, "
+            "JPEG, image dimensions, compression, or any properties of the photographs)\n"
+            "- DO NOT analyze the camera, lighting, or image quality\n"
+            "- ONLY transcribe the text, numbers, equations, problems, and educational content "
+            "that is written or printed ON the physical pages being photographed\n"
+            "- Combine content from all pages in order\n\n"
+            "Provide:\n"
+            f"1. Full verbatim transcription of ALL text across all {num_pages} pages (homework problems, "
+            "notes, vocabulary, equations, tables, answer choices, etc.)\n"
+            "2. Subject (e.g., Math, Science, History, English, Computer Science)\n"
             f"3. List of 3-5 main topics covered across all {num_pages} pages\n"
             "4. Overall difficulty level (Easy, Medium, Hard)\n\n"
-            "IMPORTANT: The content_text field must contain a COMPLETE transcription of everything "
-            "across all pages, including all numbers, answer choices, table data, and problem text. "
-            "Do NOT summarize — transcribe verbatim.\n\n"
             "You MUST respond with ONLY valid JSON, no other text:\n"
-            '{"content_text": "combined transcribed text from all pages",'
+            '{"content_text": "combined verbatim transcription from all pages",'
             ' "subject": "subject name",'
             ' "topics": ["topic1", "topic2"],'
             ' "difficulty": "level"}'
@@ -310,20 +486,18 @@ async def analyze_images(images_base64: List[str]) -> Dict[str, Any]:
     content_blocks.append({"type": "text", "text": prompt_text})
 
     try:
-        logger.info(f"[analyze_images] Sending {num_pages} image(s) to Claude Vision API")
-        message = await client.messages.create(
-            model=MODEL,
-            max_tokens=4096,
-            system="You are an expert educational content analyzer. Always respond with valid JSON only, no markdown or extra text.",
-            messages=[
-                {
-                    "role": "user",
-                    "content": content_blocks,
-                }
-            ],
+        logger.info(f"[analyze_images] Sending {num_pages} image(s) to vision model ({_settings.ai_vision_provider})")
+        raw_text = await _call_vision_model(
+            messages=[{"role": "user", "content": content_blocks}],
+            system_prompt=(
+                "You are an expert educational content analyzer. Your task is to READ the text and "
+                "educational content printed or written on physical pages shown in photos. "
+                "You must NEVER describe the photo/image file itself (no mentions of pixels, resolution, "
+                "JPEG format, file size, or image properties). "
+                "Always respond with valid JSON only, no markdown or extra text."
+            ),
         )
 
-        raw_text = message.content[0].text
         logger.info(f"[analyze_images] Claude response (first 300 chars): {raw_text[:300]}")
         result = _parse_json(
             raw_text,
@@ -335,7 +509,7 @@ async def analyze_images(images_base64: List[str]) -> Dict[str, Any]:
             },
         )
     except Exception as e:
-        logger.error(f"[analyze_images] Claude API error: {type(e).__name__}: {e}")
+        logger.error(f"[analyze_images] Claude CLI error: {type(e).__name__}: {e}")
         result = {
             "subject": "General",
             "topics": ["Study Material"],
@@ -347,6 +521,9 @@ async def analyze_images(images_base64: List[str]) -> Dict[str, Any]:
     content_text = result.get("content_text", "")
     analysis_failed = result.get("analysis_failed", False)
 
+    if not content_text:
+        analysis_failed = True
+
     # Detect garbage / placeholder content that would produce irrelevant questions
     if not analysis_failed and content_text:
         garbage_markers = [
@@ -357,6 +534,39 @@ async def analyze_images(images_base64: List[str]) -> Dict[str, Any]:
         if any(marker in content_text.lower() for marker in garbage_markers):
             analysis_failed = True
         elif len(content_text.strip()) < 20:
+            analysis_failed = True
+
+    # Contextual metadata-hallucination detection: if Claude described image
+    # file properties (JPEG, chroma subsampling, pixel resolution, etc.) instead
+    # of transcribing the page, we get bad downstream questions. Only flag this
+    # when the detected subject is NOT a CS/image-processing field — otherwise
+    # we'd false-flag legit textbook scans about image processing.
+    if not analysis_failed and content_text:
+        subject_lower = (result.get("subject") or "").lower()
+        topics_blob = " ".join(result.get("topics") or []).lower()
+        cs_signals = [
+            "computer", "programming", "software", "image processing",
+            "digital signal", "encoding", "informatics", "data structure",
+            "compression algorithm",
+        ]
+        is_cs_subject = any(s in subject_lower or s in topics_blob for s in cs_signals)
+
+        metadata_terms = [
+            "chroma subsampling", "4:2:0", "4:4:4", "4:2:2",
+            "luminance sample", "chrominance sample",
+            "8x8 block", "8×8 block", "macroblock",
+            "jpeg compression", "compression ratio",
+            "pixel resolution", "image resolution", "image dimensions",
+            "exif metadata", "color depth",
+        ]
+        content_lower = content_text.lower()
+        metadata_hits = sum(1 for term in metadata_terms if term in content_lower)
+
+        if metadata_hits >= 2 and not is_cs_subject:
+            logger.warning(
+                f"[analyze_images] Suspected metadata hallucination "
+                f"(hits={metadata_hits}, subject={subject_lower!r}) — flagging as failed"
+            )
             analysis_failed = True
 
     return {
@@ -392,10 +602,13 @@ def _build_mc_prompt(
     extra = f"\n{additional_prompts}" if additional_prompts else ""
 
     return (
-        f'Based on this content: "{content_text[:6000]}"\n\n'
+        f'CONTENT (the study material the student is learning):\n"""\n{content_text[:6000]}\n"""\n\n'
         f"{diff_instruction}\n"
-        f"Generate {num_questions} multiple-choice questions.\n"
+        f"Generate {num_questions} multiple-choice questions based STRICTLY on the CONTENT above.\n"
         f"{extra}\n\n"
+        "STRICT GROUNDING (read this first):\n"
+        "- Every question MUST be about a topic, vocabulary term, or concept that ACTUALLY APPEARS\n"
+        "  in the CONTENT. Do NOT introduce topics not present in the content.\n\n"
         "IMPORTANT RULES:\n"
         "- DO NOT copy questions exactly from the content - create NEW questions that test the SAME concepts\n"
         "- Questions should be SIMILAR in topic and difficulty but worded differently with different numbers/scenarios\n"
@@ -421,10 +634,14 @@ def _build_word_problems_prompt(
     extra = f"\n{additional_prompts}" if additional_prompts else ""
 
     return (
-        f'Based on this content: "{content_text[:6000]}"\n\n'
+        f'CONTENT (the study material the student is learning):\n"""\n{content_text[:6000]}\n"""\n\n'
         f"{diff_instruction}\n"
-        f"Generate {num_questions} word problems that require written answers.\n"
+        f"Generate {num_questions} word problems based STRICTLY on the CONTENT above.\n"
         f"{extra}\n\n"
+        "STRICT GROUNDING (read this first):\n"
+        "- Every question MUST be about a topic, vocabulary term, or concept that ACTUALLY APPEARS\n"
+        "  in the CONTENT. Do NOT introduce topics not present in the content (e.g., do not invent\n"
+        "  finance, retail, or unrelated math problems if they are not in the content).\n\n"
         "IMPORTANT RULES:\n"
         "- DO NOT copy questions exactly from the content - create NEW questions that test the SAME concepts\n"
         "- Questions should be SIMILAR in topic and difficulty but use different scenarios, names, and numbers\n"
@@ -446,25 +663,33 @@ def _build_math_prompt(
     extra = f"\n{additional_prompts}" if additional_prompts else ""
 
     return (
-        f'Based on this mathematical content: "{content_text[:6000]}"\n\n'
+        f'CONTENT (the study material the student is learning):\n"""\n{content_text[:6000]}\n"""\n\n'
         f"{diff_instruction}\n"
-        f"Generate {num_questions} math problems.\n"
+        f"Generate {num_questions} math questions based STRICTLY on the CONTENT above.\n"
         f"{extra}\n\n"
-        "CRITICAL REQUIREMENTS:\n"
-        "- DO NOT copy problems exactly from the content - create NEW problems that test the SAME concepts\n"
-        "- Problems should be SIMILAR in type and difficulty but use DIFFERENT numbers and scenarios\n"
-        "- Focus on mathematical calculations, equations, and problem-solving\n"
-        "- Cover various math concepts from the content (fractions, algebra, geometry, arithmetic, etc.)\n"
-        '- The correct_answer MUST be ONLY the final numerical answer (e.g., "3/8", "42", "1 5/12", "2.5")\n'
-        "- DO NOT include steps or explanations in correct_answer - ONLY the final answer\n"
-        "- IMPORTANT: VERIFY YOUR ARITHMETIC! Double-check every calculation. For fractions:\n"
+        "STRICT GROUNDING (read this first — it overrides everything below):\n"
+        "- Every question MUST be about a specific topic, vocabulary term, classification, formula,\n"
+        "  or skill that ACTUALLY APPEARS in the CONTENT. If the content is about classifying\n"
+        "  triangles, generate questions about classifying triangles — NOT about percentages,\n"
+        "  compound interest, gardens, JPEG compression, or any topic not in the content.\n"
+        "- DO NOT introduce math topics not present in the content. The student is studying THIS\n"
+        "  specific material, not generic math.\n"
+        "- If the content is conceptual (classifying shapes, identifying properties, naming\n"
+        "  vocabulary), generate conceptual questions — answers can be words like \"scalene\" or\n"
+        "  \"obtuse\", not just numbers. Do not force arithmetic onto non-arithmetic content.\n\n"
+        "OTHER REQUIREMENTS:\n"
+        "- DO NOT copy problems verbatim from the content — create NEW problems that test\n"
+        "  the SAME specific concepts using fresh wording or examples.\n"
+        '- The correct_answer MUST be ONLY the final answer (e.g., "3/8", "42", "1 5/12", "2.5",\n'
+        '  "scalene", "obtuse") — no steps or explanations.\n'
+        "- VERIFY arithmetic when calculations are involved. For fractions:\n"
         "  * To convert improper fraction to mixed number: divide numerator by denominator\n"
         "  * Example: 29/10 = 2 remainder 9 = 2 9/10 (NOT 2 12/25)\n"
         "  * Always simplify fractions to lowest terms\n"
-        "- ALWAYS include the $ sign for dollar/money amounts in both the question text AND correct_answer\n\n"
+        "- ALWAYS include the $ sign for dollar/money amounts in both question text AND correct_answer\n\n"
         "Respond with ONLY a JSON array, no other text:\n"
-        '[{"id": "q1", "type": "math", "text": "detailed math problem", '
-        '"correct_answer": "final answer only (e.g., \'3/8\' or \'1 5/12\' or \'$272\')"}]'
+        '[{"id": "q1", "type": "math", "text": "detailed problem", '
+        '"correct_answer": "final answer only"}]'
     )
 
 
@@ -477,10 +702,13 @@ def _build_fill_blank_prompt(
     extra = f"\n{additional_prompts}" if additional_prompts else ""
 
     return (
-        f'Based on this content: "{content_text[:6000]}"\n\n'
+        f'CONTENT (the study material the student is learning):\n"""\n{content_text[:6000]}\n"""\n\n'
         f"{diff_instruction}\n"
-        f"Generate {num_questions} fill-in-the-blank questions.\n"
+        f"Generate {num_questions} fill-in-the-blank questions based STRICTLY on the CONTENT above.\n"
         f"{extra}\n\n"
+        "STRICT GROUNDING (read this first):\n"
+        "- Every question MUST test a vocabulary term, concept, or fact that ACTUALLY APPEARS in\n"
+        "  the CONTENT. Do NOT introduce topics not present in the content.\n\n"
         "IMPORTANT RULES:\n"
         "- DO NOT copy sentences exactly from the content - create NEW sentences that test the SAME concepts\n"
         "- Questions should test vocabulary, key terms, concepts, and understanding\n"
@@ -504,10 +732,13 @@ def _build_mixed_prompt(
     extra = f"\n{additional_prompts}" if additional_prompts else ""
 
     return (
-        f'Based on this content: "{content_text[:6000]}"\n\n'
+        f'CONTENT (the study material the student is learning):\n"""\n{content_text[:6000]}\n"""\n\n'
         f"{diff_instruction}\n"
-        f"Generate {num_questions} mixed questions (combination of multiple-choice, word problems, and fill-in-the-blank).\n"
+        f"Generate {num_questions} mixed questions (combination of multiple-choice, word problems, and fill-in-the-blank) based STRICTLY on the CONTENT above.\n"
         f"{extra}\n\n"
+        "STRICT GROUNDING (read this first):\n"
+        "- Every question MUST be about a topic, vocabulary term, or concept that ACTUALLY APPEARS\n"
+        "  in the CONTENT. Do NOT introduce topics not present in the content.\n\n"
         "IMPORTANT RULES:\n"
         "- DO NOT copy questions exactly from the content - create NEW questions that test the SAME concepts\n"
         "- Questions should be SIMILAR in topic and difficulty but worded differently with different numbers/scenarios\n"
@@ -550,8 +781,6 @@ async def generate_questions(
     additional_prompts: str = None,
 ) -> List[Dict[str, Any]]:
     """Use Claude to generate test questions based on content."""
-    client = get_client()
-
     # Build additional context
     extra_parts = []
     if topics:
@@ -567,15 +796,12 @@ async def generate_questions(
     system_msg = f"You are an expert test creator. Generate {difficulty} level educational questions."
 
     try:
-        logger.info(f"[generate_questions] type={test_type}, model={MODEL}, num={num_questions}, content_len={len(content_text)}")
-        message = await client.messages.create(
-            model=MODEL,
-            max_tokens=4096,
-            system=system_msg,
+        logger.info(f"[generate_questions] type={test_type}, provider={_settings.ai_text_provider}, num={num_questions}, content_len={len(content_text)}")
+        raw_text = await _call_text_model(
             messages=[{"role": "user", "content": prompt}],
+            system_prompt=system_msg,
         )
 
-        raw_text = message.content[0].text
         logger.info(f"[generate_questions] Claude response (first 300 chars): {raw_text[:300]}")
 
         # Parse — Emergent wraps in {"questions": [...]}, we also handle bare arrays
@@ -589,7 +815,7 @@ async def generate_questions(
 
         logger.info(f"[generate_questions] Parsed {len(questions_raw)} questions")
     except Exception as e:
-        logger.error(f"[generate_questions] Claude API error: {type(e).__name__}: {e}")
+        logger.error(f"[generate_questions] Claude CLI error: {type(e).__name__}: {e}")
         questions_raw = []
 
     questions = []
@@ -675,12 +901,8 @@ async def grade_answer_smart(question: Dict[str, Any], user_answer: str) -> Dict
         return {"is_correct": True, "explanation": "", "correct_answer": correct}
 
     # Tier 3: LLM verification
-    client = get_client()
     try:
-        message = await client.messages.create(
-            model=MODEL,
-            max_tokens=512,
-            system="You are a math teacher verifying student answers. Be accurate with arithmetic.",
+        raw_text = await _call_text_model(
             messages=[
                 {
                     "role": "user",
@@ -695,9 +917,10 @@ async def grade_answer_smart(question: Dict[str, Any], user_answer: str) -> Dict
                     ),
                 }
             ],
+            system_prompt="You are a math teacher verifying student answers. Be accurate with arithmetic.",
         )
         result = _parse_json(
-            message.content[0].text,
+            raw_text,
             {"is_correct": False, "actual_answer": correct},
         )
         return {
@@ -706,7 +929,7 @@ async def grade_answer_smart(question: Dict[str, Any], user_answer: str) -> Dict
             "correct_answer": result.get("actual_answer", correct),
         }
     except Exception as e:
-        logger.error(f"Claude API error in grade_answer_smart: {e}")
+        logger.error(f"Claude CLI error in grade_answer_smart: {e}")
         return {"is_correct": False, "explanation": "", "correct_answer": correct}
 
 
@@ -717,8 +940,6 @@ async def check_math_content(content_text: str) -> bool:
     we allow it. The purpose is only to block clearly non-math content (e.g., a
     pure literature passage with zero numbers).
     """
-    import re
-
     text_lower = content_text.lower()
     logger.info(f"[check_math_content] Content length: {len(content_text)}, first 200 chars: {content_text[:200]}")
 
@@ -777,21 +998,8 @@ async def generate_study_guide_entry(
     question: str, user_answer: str, correct_answer: str
 ) -> Dict[str, str]:
     """Use Claude to generate an explanation and tips for a wrong answer."""
-    client = get_client()
-
     try:
-        message = await client.messages.create(
-            model=MODEL,
-            max_tokens=1024,
-            system=(
-                "You are a friendly, encouraging tutor helping students aged 10-16. "
-                "Look at the question content to gauge the student's likely grade level "
-                "(e.g., basic multiplication = younger ~10-11, algebra = ~13-14, geometry proofs = ~15-16). "
-                "Tailor your language and explanations to match their age — use simple words for younger "
-                "students, more detailed reasoning for older ones. "
-                "Be warm and encouraging. Use relatable examples. "
-                "NEVER use LaTeX — write fractions as 3/4, not \\frac{3}{4}."
-            ),
+        raw_text = await _call_text_model(
             messages=[
                 {
                     "role": "user",
@@ -811,18 +1019,27 @@ async def generate_study_guide_entry(
                     ),
                 }
             ],
+            system_prompt=(
+                "You are a friendly, encouraging tutor helping students aged 10-16. "
+                "Look at the question content to gauge the student's likely grade level "
+                "(e.g., basic multiplication = younger ~10-11, algebra = ~13-14, geometry proofs = ~15-16). "
+                "Tailor your language and explanations to match their age — use simple words for younger "
+                "students, more detailed reasoning for older ones. "
+                "Be warm and encouraging. Use relatable examples. "
+                "NEVER use LaTeX — write fractions as 3/4, not \\frac{3}{4}."
+            ),
         )
 
         result = _parse_json(
-            message.content[0].text,
+            raw_text,
             {
-                "explanation": message.content[0].text[:300],
+                "explanation": raw_text[:300],
                 "tips": "Review the material related to this topic and try similar practice problems.",
                 "practice_question": "Can you explain this concept in your own words?",
             },
         )
     except Exception as e:
-        logger.error(f"Claude API error in generate_study_guide_entry: {e}")
+        logger.error(f"Claude CLI error in generate_study_guide_entry: {e}")
         result = {
             "explanation": "Review the correct answer and compare it with your response.",
             "tips": "Review the material and try again.",
@@ -843,18 +1060,11 @@ async def generate_flashcards(
     topics: List[str] = None,
 ) -> List[Dict[str, str]]:
     """Use Claude to generate flashcard pairs from study content."""
-    client = get_client()
-
     topics_note = f"\nFocus on these topics: {', '.join(topics)}" if topics else ""
-    extra = (
-        f"\n{additional_prompts}" if additional_prompts else ""
-    )
+    extra = f"\n{additional_prompts}" if additional_prompts else ""
 
     try:
-        message = await client.messages.create(
-            model=MODEL,
-            max_tokens=4096,
-            system="You are an expert flashcard creator. Create effective study cards.",
+        raw_text = await _call_text_model(
             messages=[
                 {
                     "role": "user",
@@ -873,9 +1083,10 @@ async def generate_flashcards(
                     ),
                 }
             ],
+            system_prompt="You are an expert flashcard creator. Create effective study cards.",
         )
 
-        parsed = _parse_json(message.content[0].text, [])
+        parsed = _parse_json(raw_text, [])
         # Handle {"cards": [...]} wrapper
         if isinstance(parsed, dict) and "cards" in parsed:
             cards = parsed["cards"]
@@ -884,7 +1095,7 @@ async def generate_flashcards(
         else:
             cards = []
     except Exception as e:
-        logger.error(f"Claude API error in generate_flashcards: {e}")
+        logger.error(f"Claude CLI error in generate_flashcards: {e}")
         cards = [
             {
                 "front": "AI generation error",
@@ -941,18 +1152,34 @@ TUTOR_SYSTEM_PROMPT = (
 )
 
 
+async def generate_session_title(user_message: str, assistant_response: str) -> str:
+    """Generate a short descriptive title for a tutor chat session after the first exchange."""
+    try:
+        prompt = (
+            f"Write a short 4-6 word title for this tutoring conversation. "
+            f"No quotes, no period, just the title.\n\n"
+            f"Student: {user_message[:300]}\n\nTutor: {assistant_response[:300]}"
+        )
+        title = await _call_text_model(
+            messages=[{"role": "user", "content": prompt}],
+            system_prompt="You write short, descriptive chat titles.",
+        )
+        return title.strip().strip('"\'').rstrip('.')
+    except Exception:
+        return user_message[:47] + "..." if len(user_message) > 50 else user_message
+
+
 async def generate_tutor_response(
     messages: List[Dict[str, str]],
     latest_message: str,
     image_base64: str = None,
+    about_me: Optional[str] = None,
 ) -> str:
     """Use Claude as an AI tutor to respond to student questions.
 
     If image_base64 is provided, the image is sent directly to Claude Vision
     alongside the text so Claude can actually *see* the student's homework.
     """
-    client = get_client()
-
     # Build conversation history for Claude (last 10 messages for context)
     claude_messages = []
     for msg in messages[-10:]:
@@ -1006,17 +1233,36 @@ async def generate_tutor_response(
         else:
             claude_messages.append({"role": "user", "content": multimodal_content})
 
-    try:
-        message = await client.messages.create(
-            model=MODEL,
-            max_tokens=2048,
-            system=TUTOR_SYSTEM_PROMPT,
-            messages=claude_messages,
+    # Use the vision dispatcher when an image is attached (better OCR on student
+    # homework), the text dispatcher otherwise (faster/cheaper for plain Q&A).
+    tutor_provider = _settings.ai_vision_provider if image_base64 else _settings.ai_text_provider
+
+    logger.info(
+        "[generate_tutor_response] calling provider=%s msg_count=%d has_image=%s",
+        tutor_provider,
+        len(claude_messages),
+        bool(image_base64),
+    )
+
+    system_prompt = TUTOR_SYSTEM_PROMPT
+    if about_me and about_me.strip():
+        system_prompt = (
+            f"STUDENT PROFILE (use this to personalize your help):\n{about_me.strip()}\n\n"
+            + TUTOR_SYSTEM_PROMPT
         )
 
-        return message.content[0].text
+    try:
+        if image_base64:
+            return await _call_vision_model(messages=claude_messages, system_prompt=system_prompt)
+        return await _call_text_model(messages=claude_messages, system_prompt=system_prompt)
     except Exception as e:
-        logger.error(f"Claude API error in generate_tutor_response: {e}")
+        logger.exception(
+            "[generate_tutor_response] call failed provider=%s has_image=%s err_type=%s err=%s",
+            tutor_provider,
+            bool(image_base64),
+            type(e).__name__,
+            e,
+        )
         return (
             "I'm having a little trouble connecting right now. "
             "Could you try asking your question again in a moment?"

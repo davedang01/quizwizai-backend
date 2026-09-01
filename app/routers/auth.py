@@ -6,6 +6,7 @@ from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, Response, Cookie, Request
 from pydantic import BaseModel, EmailStr
+from typing import Optional
 from datetime import datetime, timedelta
 import bcrypt
 import secrets
@@ -167,6 +168,10 @@ class ResetPasswordRequest(BaseModel):
     new_password: str
 
 
+class AboutMeRequest(BaseModel):
+    about_me: str
+
+
 class AuthResponse(BaseModel):
     user: dict
     token: str
@@ -237,6 +242,7 @@ async def signup(request: SignupRequest, response: Response):
         "name": request.name.strip(),
         "email": normalized_email,
         "password_hash": hashed_password,
+        "about_me": None,
         "created_at": datetime.utcnow().isoformat(),
         "updated_at": datetime.utcnow().isoformat()
     }
@@ -430,7 +436,37 @@ async def get_me(request: Request, session_token: str = Cookie(None)):
         "name": user["name"],
         "email": user["email"],
         "created_at": user["created_at"],
+        "about_me": user.get("about_me"),
     }
+
+
+@router.put("/me/about")
+async def update_about_me(
+    request: AboutMeRequest,
+    token: str = Cookie(None, alias="session_token"),
+    req: Request = None,
+):
+    # Accept cookie or Bearer token
+    if not token and req:
+        auth_header = req.headers.get("authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    sessions_collection = get_user_sessions_collection()
+    session = await sessions_collection.find_one({"token": token})
+    if not session:
+        raise HTTPException(status_code=401, detail="Session not found")
+    if datetime.fromisoformat(session["expires_at"]) < datetime.utcnow():
+        raise HTTPException(status_code=401, detail="Session expired")
+
+    users_collection = get_users_collection()
+    await users_collection.update_one(
+        {"_id": session["user_id"]},
+        {"$set": {"about_me": request.about_me, "updated_at": datetime.utcnow().isoformat()}},
+    )
+    return {"message": "About Me saved"}
 
 
 @router.post("/logout")

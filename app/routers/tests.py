@@ -1,9 +1,9 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
-from typing import List, Optional, Any
+from typing import List, Optional, Any, Dict
 import uuid
 from datetime import datetime
-from ..database import get_tests_collection, get_scans_collection, get_results_collection
+from ..database import get_tests_collection, get_scans_collection, get_results_collection, get_users_collection
 from ..dependencies import get_current_user
 from ..services import ai_stub
 
@@ -31,6 +31,11 @@ class SubmitTestRequest(BaseModel):
     answers: List[SubmitAnswerItem]
 
 
+class SaveProgressRequest(BaseModel):
+    question_id: str
+    answer: str
+
+
 class QuestionResponse(BaseModel):
     id: str
     type: str
@@ -49,6 +54,7 @@ class TestResponse(BaseModel):
     questions: List[dict]
     is_completed: bool
     score: Optional[float] = None
+    partial_answers: Dict[str, str] = {}
     created_at: str
 
 
@@ -103,13 +109,20 @@ async def generate_test(request: GenerateTestRequest, current_user: dict = Depen
                 detail="Hmm it appears the provided images are not Math-related. Please try another Quiz Type."
             )
 
+    users_collection = get_users_collection()
+    user_doc = await users_collection.find_one({"_id": current_user["_id"]})
+    about_me = user_doc.get("about_me") if user_doc else None
+    effective_prompts = request.additional_prompts or ""
+    if about_me and about_me.strip():
+        effective_prompts = f"Student profile: {about_me.strip()}\n{effective_prompts}".strip()
+
     questions = await ai_stub.generate_questions(
         content_text=content_text,
         test_type=request.test_type,
         difficulty=request.difficulty,
         num_questions=request.num_questions,
         topics=topics,
-        additional_prompts=request.additional_prompts,
+        additional_prompts=effective_prompts or None,
     )
 
     tests_collection = get_tests_collection()
@@ -123,6 +136,7 @@ async def generate_test(request: GenerateTestRequest, current_user: dict = Depen
         "questions": questions,
         "is_completed": False,
         "score": None,
+        "partial_answers": {},
         "additional_prompts": request.additional_prompts,
         "created_at": datetime.utcnow().isoformat(),
         "updated_at": datetime.utcnow().isoformat()
@@ -140,6 +154,7 @@ async def generate_test(request: GenerateTestRequest, current_user: dict = Depen
         questions=test["questions"],
         is_completed=test["is_completed"],
         score=test["score"],
+        partial_answers=test.get("partial_answers", {}),
         created_at=test["created_at"]
     )
 
@@ -162,6 +177,7 @@ async def get_all_tests(current_user: dict = Depends(get_current_user)):
             questions=test["questions"],
             is_completed=test["is_completed"],
             score=test.get("score"),
+            partial_answers=test.get("partial_answers", {}),
             created_at=test["created_at"]
         )
         for test in tests
@@ -186,8 +202,33 @@ async def get_test(test_id: str, current_user: dict = Depends(get_current_user))
         questions=test["questions"],
         is_completed=test["is_completed"],
         score=test.get("score"),
+        partial_answers=test.get("partial_answers", {}),
         created_at=test["created_at"]
     )
+
+
+@router.post("/{test_id}/save-progress")
+async def save_test_progress(
+    test_id: str,
+    request: SaveProgressRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Persist a single in-progress answer so the user can resume the test later."""
+    tests_collection = get_tests_collection()
+    result = await tests_collection.update_one(
+        {"_id": test_id, "user_id": current_user["_id"], "is_completed": False},
+        {
+            "$set": {
+                f"partial_answers.{request.question_id}": request.answer,
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+        }
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Test not found or already completed")
+
+    return {"saved": True}
 
 
 @router.delete("/{test_id}")
@@ -213,6 +254,7 @@ async def reset_test(test_id: str, current_user: dict = Depends(get_current_user
             "$set": {
                 "is_completed": False,
                 "score": None,
+                "partial_answers": {},
                 "updated_at": datetime.utcnow().isoformat()
             }
         }
@@ -283,6 +325,7 @@ async def submit_test(request: SubmitTestRequest, current_user: dict = Depends(g
             "$set": {
                 "is_completed": True,
                 "score": score,
+                "partial_answers": {},
                 "updated_at": datetime.utcnow().isoformat()
             }
         }

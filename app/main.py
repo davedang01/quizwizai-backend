@@ -28,7 +28,7 @@ app = FastAPI(
 # Allow Netlify frontend + local dev origins
 allowed_origins = os.environ.get(
     "ALLOWED_ORIGINS",
-    "http://localhost:5173,http://localhost:3000"
+    "http://localhost:3002,http://localhost:5173,http://localhost:3000,https://quizwiz.dangsamfam.com"
 ).split(",")
 
 app.add_middleware(
